@@ -4,6 +4,7 @@ import android.app.*
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
+import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.hardware.display.DisplayManager
@@ -21,21 +22,18 @@ import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
-import kotlin.math.abs
 
-/** Captura la pantalla, lee los números con OCR y ordena el tap. */
+/** Captura la pantalla, localiza el cuadrado amarillo (número a pulsar) y toca el botón igual. */
 class CaptureService : Service() {
     companion object {
         const val ACTION_STOP = "stop"
-        // Ajustes (fracción de la altura de pantalla)
-        const val TOP_MIN = 0.04f
-        const val TOP_MAX = 0.38f      // fila superior de 8 números
-        const val GRID_MIN = 0.38f     // botones de colores
-        const val TAP_DELAY_MS = 250L  // espera antes del tap
-        const val COOLDOWN_MS = 250L   // pausa tras cada tap
+        // Zonas (fracción de la altura de pantalla)
+        const val TOP_MIN = 0.03f      // donde se busca el cuadrado amarillo
+        const val TOP_MAX = 0.38f
+        const val GRID_MIN = 0.38f     // desde aquí se buscan los botones de colores
+        const val TAP_DELAY_MS = 200L  // espera antes del tap
+        const val COOLDOWN_MS = 700L   // pausa tras cada tap
     }
-
-    private data class D(val c: Char, val r: Rect)
 
     private val h = Handler(Looper.getMainLooper())
     private var proj: MediaProjection? = null
@@ -92,6 +90,7 @@ class CaptureService : Service() {
         else startForeground(1, n)
     }
 
+    // ---------- 1) captura y localización del cuadrado amarillo ----------
     private fun grab() {
         val img = reader?.acquireLatestImage() ?: return
         val bmp = try {
@@ -99,65 +98,99 @@ class CaptureService : Service() {
             val pad = (p.rowStride - p.pixelStride * W) / p.pixelStride
             Bitmap.createBitmap(W + pad, H, Bitmap.Config.ARGB_8888).also { it.copyPixelsFromBuffer(p.buffer) }
         } finally { img.close() }
+
+        val box = findYellow(bmp) ?: return          // no hay cuadrado amarillo: seguimos esperando
         busy = true
-        rec.process(InputImage.fromBitmap(bmp, 0))
-            .addOnSuccessListener { analyze(bmp, it) }
+        rec.process(InputImage.fromBitmap(tileBitmap(bmp, box), 0))
+            .addOnSuccessListener { onTile(bmp, box, it) }
             .addOnFailureListener { busy = false }
     }
 
-    private fun analyze(bmp: Bitmap, t: Text) {
-        var hold = false
-        try {
-            val ds = mutableListOf<D>()
-            for (b in t.textBlocks) for (l in b.lines) for (e in l.elements) {
-                val s = e.text; val r = e.boundingBox ?: continue
-                if (s.isEmpty() || !s.all { it.isDigit() }) continue
-                val cw = r.width().toFloat() / s.length
-                s.forEachIndexed { k, ch ->
-                    ds += D(ch, Rect((r.left + k * cw).toInt(), r.top, (r.left + (k + 1) * cw).toInt(), r.bottom))
+    /** Amarillo (FFEB3B) con número negro = el que toca pulsar. */
+    private fun findYellow(bmp: Bitmap): Rect? {
+        val y0 = (TOP_MIN * H).toInt(); val y1 = (TOP_MAX * H).toInt()
+        var minX = Int.MAX_VALUE; var minY = Int.MAX_VALUE; var maxX = -1; var maxY = -1; var n = 0
+        var y = y0
+        while (y < y1) {
+            var x = 0
+            while (x < W) {
+                val c = bmp.getPixel(x, y)
+                val r = Color.red(c); val g = Color.green(c); val b = Color.blue(c)
+                if (r > 225 && g > 215 && b < 120) {
+                    if (x < minX) minX = x; if (x > maxX) maxX = x
+                    if (y < minY) minY = y; if (y > maxY) maxY = y
+                    n++
                 }
+                x += 3
             }
-            // --- fila superior: el grupo más numeroso alineado en Y ---
-            val top = ds.filter { it.r.centerY() in (TOP_MIN * H).toInt()..(TOP_MAX * H).toInt() }
-            val row = top.map { d -> top.filter { abs(it.r.centerY() - d.r.centerY()) < d.r.height() * 0.6f } }
-                .maxByOrNull { it.size }?.sortedBy { it.r.left } ?: return
-            if (row.size < 2) return
-            // el más a la izquierda que no esté ya marcado como hecho (fondo verde)
-            val cur = row.firstOrNull { !isDone(bmp, it.r) } ?: return
-            val target = cur.c
-            val rowStr = row.joinToString("") { it.c.toString() }
-            val key = "$rowStr@${cur.r.left / 20}"
-            val now = System.currentTimeMillis()
-            if (key == lastKey && now - lastTap < 2000) return
-
-            val svc = TapService.instance
-            val grid = ds.filter { it.c == target && it.r.centerY() > GRID_MIN * H }
-                .maxByOrNull { it.r.height() }
-            if (grid == null) { svc?.say("Detectado: [$target] (botón no encontrado)"); return }
-
-            svc?.say("Detectado: [$target]")
-            lastKey = key
-            hold = true
-            h.postDelayed({
-                TapService.instance?.tap(grid.r.centerX().toFloat(), grid.r.centerY().toFloat())
-                lastTap = System.currentTimeMillis()
-                h.postDelayed({ busy = false }, COOLDOWN_MS)
-            }, TAP_DELAY_MS)
-        } finally { if (!hold) busy = false }
+            y += 3
+        }
+        if (n < 30) return null
+        val box = Rect(minX, minY, maxX, maxY)
+        val w = box.width(); val hh = box.height()
+        if (w < 30 || hh < 30 || w > hh * 1.8 || hh > w * 1.8) return null   // debe ser un cuadrado
+        if (n * 9f / (w * hh) < 0.5f) return null                              // y estar bien relleno
+        return box
     }
 
-    /** Fondo verde/teal (por encima/debajo del dígito) = ya completado. */
-    private fun isDone(b: Bitmap, r: Rect): Boolean {
-        val off = (r.height() * 0.6f).toInt()
-        var rs = 0; var gs = 0; var n = 0
-        for (y in listOf(r.top - off, r.bottom + off)) {
-            val x = r.centerX()
-            if (x in 0 until b.width && y in 0 until b.height) {
-                val c = b.getPixel(x, y)
-                rs += (c shr 16) and 255; gs += (c shr 8) and 255; n++
+    /** Recorta el cuadrado, lo amplía x2 y lo pasa a blanco/negro para que el OCR lea mejor. */
+    private fun tileBitmap(bmp: Bitmap, box: Rect): Bitmap {
+        val inset = (box.width() * 0.12f).toInt()
+        val r = Rect(box.left + inset, box.top + inset, box.right - inset, box.bottom - inset)
+        val s = 2; val pad = 24
+        val ow = r.width() * s + pad * 2; val oh = r.height() * s + pad * 2
+        val px = IntArray(ow * oh) { Color.WHITE }
+        for (y in 0 until r.height()) for (x in 0 until r.width()) {
+            val c = bmp.getPixel(r.left + x, r.top + y)
+            val l = (Color.red(c) * 299 + Color.green(c) * 587 + Color.blue(c) * 114) / 1000
+            if (l < 110) for (dy in 0 until s) for (dx in 0 until s)
+                px[(pad + y * s + dy) * ow + pad + x * s + dx] = Color.BLACK
+        }
+        return Bitmap.createBitmap(ow, oh, Bitmap.Config.ARGB_8888).also { it.setPixels(px, 0, ow, 0, 0, ow, oh) }
+    }
+
+    // ---------- 2) número leído en el cuadrado amarillo ----------
+    private fun onTile(bmp: Bitmap, box: Rect, t: Text) {
+        val digits = t.text.filter { it.isDigit() }
+        if (digits.length != 1) { busy = false; return }
+        val target = digits[0]
+        val key = "$target@${box.left / 20}"
+        if (key == lastKey && System.currentTimeMillis() - lastTap < 2000) { busy = false; return }
+        TapService.instance?.say("Detectado: [$target]")
+
+        val gy = (GRID_MIN * H).toInt()
+        val grid = Bitmap.createBitmap(bmp, 0, gy, W, H - gy)
+        rec.process(InputImage.fromBitmap(grid, 0))
+            .addOnSuccessListener { onGrid(it, gy, target, key) }
+            .addOnFailureListener { busy = false }
+    }
+
+    // ---------- 3) buscar el botón de color con ese número y tocar ----------
+    private fun onGrid(t: Text, gy: Int, target: Char, key: String) {
+        var best: Rect? = null
+        for (b in t.textBlocks) for (l in b.lines) for (e in l.elements) {
+            val s = e.text; val r = e.boundingBox ?: continue
+            if (s.isEmpty() || !s.all { it.isDigit() }) continue
+            val cw = r.width().toFloat() / s.length
+            s.forEachIndexed { k, ch ->
+                if (ch == target) {
+                    val d = Rect((r.left + k * cw).toInt(), r.top, (r.left + (k + 1) * cw).toInt(), r.bottom)
+                    if (best == null || d.height() > best!!.height()) best = d
+                }
             }
         }
-        return n > 0 && gs / n > rs / n + 25 && gs / n > 100
+        val hit = best
+        if (hit == null) {
+            TapService.instance?.say("Detectado: [$target] (botón no encontrado)")
+            busy = false; return
+        }
+        lastKey = key
+        val x = hit.centerX().toFloat(); val y = (hit.centerY() + gy).toFloat()
+        h.postDelayed({
+            TapService.instance?.tap(x, y)
+            lastTap = System.currentTimeMillis()
+            h.postDelayed({ busy = false }, COOLDOWN_MS)
+        }, TAP_DELAY_MS)
     }
 
     override fun onDestroy() {
