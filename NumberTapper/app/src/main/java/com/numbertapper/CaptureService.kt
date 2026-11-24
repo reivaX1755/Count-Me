@@ -29,8 +29,8 @@ class CaptureService : Service() {
         const val ACTION_STOP = "stop"
         // Zonas (fracción de la altura de pantalla)
         const val TOP_MIN = 0.03f      // donde se busca el cuadrado amarillo
-        const val TOP_MAX = 0.38f
-        const val GRID_MIN = 0.38f     // desde aquí se buscan los botones de colores
+        const val TOP_MAX = 0.42f
+        const val GRID_MIN = 0.42f     // desde aquí se buscan los botones de colores
         const val TAP_DELAY_MS = 200L  // espera antes del tap
         const val COOLDOWN_MS = 700L   // pausa tras cada tap
     }
@@ -93,13 +93,22 @@ class CaptureService : Service() {
     // ---------- 1) captura y localización del cuadrado amarillo ----------
     private fun grab() {
         val img = reader?.acquireLatestImage() ?: return
+        try { grabInner(img) } catch (e: Exception) {
+            busy = false
+            TapService.instance?.say("Error: ${e.javaClass.simpleName} ${e.message}")
+        }
+    }
+
+    private fun grabInner(img: android.media.Image) {
         val bmp = try {
             val p = img.planes[0]
             val pad = (p.rowStride - p.pixelStride * W) / p.pixelStride
             Bitmap.createBitmap(W + pad, H, Bitmap.Config.ARGB_8888).also { it.copyPixelsFromBuffer(p.buffer) }
         } finally { img.close() }
 
-        val box = findYellow(bmp) ?: return          // no hay cuadrado amarillo: seguimos esperando
+        val box = findYellow(bmp)
+        if (box == null) { TapService.instance?.say("Buscando cuadrado amarillo..."); return }
+        TapService.instance?.say("Amarillo encontrado, leyendo número...")
         busy = true
         rec.process(InputImage.fromBitmap(tileBitmap(bmp, box), 0))
             .addOnSuccessListener { onTile(bmp, box, it) }
@@ -109,14 +118,15 @@ class CaptureService : Service() {
     /** Amarillo (FFEB3B) con número negro = el que toca pulsar. */
     private fun findYellow(bmp: Bitmap): Rect? {
         val y0 = (TOP_MIN * H).toInt(); val y1 = (TOP_MAX * H).toInt()
+        val hsv = FloatArray(3)
         var minX = Int.MAX_VALUE; var minY = Int.MAX_VALUE; var maxX = -1; var maxY = -1; var n = 0
         var y = y0
         while (y < y1) {
             var x = 0
             while (x < W) {
                 val c = bmp.getPixel(x, y)
-                val r = Color.red(c); val g = Color.green(c); val b = Color.blue(c)
-                if (r > 225 && g > 215 && b < 120) {
+                Color.colorToHSV(c, hsv)
+                if (hsv[0] in 50f..66f && hsv[1] > 0.45f && hsv[2] > 0.8f) {
                     if (x < minX) minX = x; if (x > maxX) maxX = x
                     if (y < minY) minY = y; if (y > maxY) maxY = y
                     n++
@@ -128,8 +138,8 @@ class CaptureService : Service() {
         if (n < 30) return null
         val box = Rect(minX, minY, maxX, maxY)
         val w = box.width(); val hh = box.height()
-        if (w < 30 || hh < 30 || w > hh * 1.8 || hh > w * 1.8) return null   // debe ser un cuadrado
-        if (n * 9f / (w * hh) < 0.5f) return null                              // y estar bien relleno
+        if (w < 30 || hh < 30 || w > hh * 2.5 || hh > w * 2.5) return null   // debe ser un cuadrado
+        if (n * 9f / (w * hh) < 0.35f) return null                              // y estar bien relleno
         return box
     }
 
@@ -152,7 +162,10 @@ class CaptureService : Service() {
     // ---------- 2) número leído en el cuadrado amarillo ----------
     private fun onTile(bmp: Bitmap, box: Rect, t: Text) {
         val digits = t.text.filter { it.isDigit() }
-        if (digits.length != 1) { busy = false; return }
+        if (digits.isEmpty()) {
+            TapService.instance?.say("Amarillo visto, pero OCR no lee número: '${t.text}'")
+            busy = false; return
+        }
         val target = digits[0]
         val key = "$target@${box.left / 20}"
         if (key == lastKey && System.currentTimeMillis() - lastTap < 2000) { busy = false; return }
