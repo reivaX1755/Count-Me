@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">NumberTapper</string>
+    <string name="a11y_desc">Permite a NumberTapper pulsar en la pantalla y mostrar el marcador de toque.</string>
+</resources>
